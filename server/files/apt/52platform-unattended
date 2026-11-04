@@ -1,0 +1,12 @@
+// Managed by platform/server/bootstrap.sh
+// Only Ubuntu security origins are upgraded (distro default). Docker CE comes
+// from its own repository and is intentionally upgraded by hand.
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+
+// Kernel/libc fixes need a reboot. Containers restart on their own
+// (restart policies), so reboot only when required, at 04:30 BRT (07:30 UTC).
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
+Unattended-Upgrade::Automatic-Reboot-Time "07:30";

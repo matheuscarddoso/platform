@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# CI deploy entrypoint. Never invoked directly: sshd runs it as a forced
+# command bound to one app per key, in /home/deploy/.ssh/authorized_keys:
+#
+#   restrict,command="/usr/local/bin/ci-deploy <app>" ssh-ed25519 AAAA... ci:<owner>/<repo>
+#
+# The client can only send "deploy <image-tag>". The app (and therefore the
+# Coolify resource and image repository) is fixed by the key, so a leaked
+# key from one repository can never touch another app.
+#
+# Config:
+#   /etc/ci-deploy/coolify.token      Coolify API token (root:deploy 0640)
+#   /etc/ci-deploy/apps/<app>.env     COOLIFY_APP_UUID=<uuid>
+set -Eeuo pipefail
+
+readonly CONF=/etc/ci-deploy
+readonly API=http://127.0.0.1:8000/api/v1
+readonly TIMEOUT_S="${CI_DEPLOY_TIMEOUT:-600}"
+
+die() { echo "ci-deploy: $*" >&2; exit 1; }
+
+app="${1:-}"
+[[ "$app" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die "invalid app binding"
+[[ -r "$CONF/apps/$app.env" ]] || die "app '$app' is not registered"
+
+read -r verb tag extra <<<"${SSH_ORIGINAL_COMMAND:-}" || true
+[[ "${verb:-}" == deploy && -z "${extra:-}" ]] || die "usage: deploy <image-tag>"
+[[ "${tag:-}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || die "invalid image tag"
+
+uuid="$(sed -n 's/^COOLIFY_APP_UUID=\([A-Za-z0-9]\{1,64\}\)$/\1/p' "$CONF/apps/$app.env")"
+[[ -n "$uuid" ]] || die "COOLIFY_APP_UUID missing for '$app'"
+token="$(<"$CONF/coolify.token")"
+
+api() {
+  curl -fsS --max-time 30 \
+    -H "Authorization: Bearer $token" \
+    -H 'Accept: application/json' -H 'Content-Type: application/json' \
+    "$@"
+}
+
+started=$SECONDS
+echo "→ $app: deploying tag $tag"
+
+api -X PATCH "$API/applications/$uuid" \
+  -d "$(jq -cn --arg t "$tag" '{docker_registry_image_tag: $t}')" >/dev/null \
+  || die "failed to set image tag"
+
+resp="$(api "$API/deploy?uuid=$uuid&force=false")" || die "failed to queue deployment"
+dep="$(jq -r '.deployments[0].deployment_uuid // empty' <<<"$resp")"
+[[ -n "$dep" ]] || die "unexpected deploy response: $resp"
+echo "  deployment $dep queued"
+
+last=""
+while (( SECONDS - started < TIMEOUT_S )); do
+  body="$(api "$API/deployments/$dep")" || { sleep 2; continue; }
+  status="$(jq -r '.status' <<<"$body")"
+  [[ "$status" != "$last" ]] && { echo "  status: $status ($(( SECONDS - started ))s)"; last="$status"; }
+  case "$status" in
+    finished)
+      echo "✓ $app live with $tag in $(( SECONDS - started ))s"
+      exit 0 ;;
+    failed|cancelled*)
+      echo "✗ deployment $status — last log lines:" >&2
+      jq -r '.logs // "[]" | fromjson? // [] | map(select(.hidden != true) | .output) | .[-40:][]' \
+        <<<"$body" >&2 || true
+      exit 1 ;;
+  esac
+  sleep 1
+done
+die "timed out after ${TIMEOUT_S}s (deployment $dep is still running in Coolify)"

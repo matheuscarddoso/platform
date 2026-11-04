@@ -1,0 +1,14 @@
+# Managed by platform/server/bootstrap.sh
+[DEFAULT]
+backend = systemd
+bantime = 1h
+bantime.increment = true
+bantime.maxtime = 1w
+findtime = 10m
+maxretry = 5
+# Never ban loopback or container networks (Coolify reaches the host over SSH).
+ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+
+[sshd]
+enabled = true
+mode = aggressive

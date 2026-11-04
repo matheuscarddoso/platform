@@ -1,0 +1,12 @@
+# BEGIN platform-docker-user
+# Managed by platform/server/bootstrap.sh - internet -> container allowlist.
+*filter
+:DOCKER-USER - [0:0]
+-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+-A DOCKER-USER ! -i __PUBLIC_IF__ -j RETURN
+-A DOCKER-USER -p tcp -m conntrack --ctorigdstport 80 -j RETURN
+-A DOCKER-USER -p tcp -m conntrack --ctorigdstport 443 -j RETURN
+-A DOCKER-USER -p udp -m conntrack --ctorigdstport 443 -j RETURN
+-A DOCKER-USER -j DROP
+COMMIT
+# END platform-docker-user

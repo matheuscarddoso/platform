@@ -1,0 +1,34 @@
+# Copy to .github/workflows/deploy.yml in the app repository.
+# Requires (set by scripts/onboard-app.sh):
+#   secrets.DEPLOY_SSH_KEY           per-repo key, bound to this app on the server
+#   vars.DEPLOY_HOST                 server address
+#   vars.DEPLOY_KNOWN_HOSTS          pinned server host key
+# Optional:
+#   secrets.BUILD_ENV                dotenv with build-time vars (NEXT_PUBLIC_*)
+#   vars.APP_URL                     public URL shown on the GitHub deployment
+# And `output: "standalone"` in next.config.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One production deploy at a time; a newer push waits and supersedes queued ones.
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    uses: matheuscarddoso/platform/.github/workflows/deploy-nextjs.yml@v1
+    permissions:
+      contents: read
+      packages: write
+    with:
+      deploy-host: ${{ vars.DEPLOY_HOST }}
+      known-hosts: ${{ vars.DEPLOY_KNOWN_HOSTS }}
+      environment-url: ${{ vars.APP_URL }}
+    secrets:
+      deploy-ssh-key: ${{ secrets.DEPLOY_SSH_KEY }}
+      build-env: ${{ secrets.BUILD_ENV }}
