@@ -61,9 +61,9 @@ while (( SECONDS - started < TIMEOUT_S )); do
       echo "✓ $app live with $tag in $(( SECONDS - started ))s"
       exit 0 ;;
     failed|cancelled*)
-      echo "✗ deployment $status — last log lines:" >&2
-      jq -r '.logs // "[]" | fromjson? // [] | map(select(.hidden != true) | .output) | .[-40:][]' \
-        <<<"$body" >&2 || true
+      echo "✗ deployment $dep $status after $(( SECONDS - started ))s" >&2
+      # The API withholds deployment logs from non-root tokens; point to them.
+      echo "  logs: Coolify panel → Projects → production → $app → Deployments" >&2
       exit 1 ;;
   esac
   sleep 1
