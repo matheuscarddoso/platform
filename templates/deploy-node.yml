@@ -1,0 +1,36 @@
+# Copy to .github/workflows/deploy.yml in a Node app that isn't Next.js.
+# Requires (set by scripts/onboard-app.sh):
+#   secrets.DEPLOY_SSH_KEY           per-repo key, bound to this app on the server
+#   vars.DEPLOY_HOST                 server address
+#   vars.DEPLOY_KNOWN_HOSTS          pinned server host key
+# Optional:
+#   secrets.BUILD_ENV                dotenv with build-time vars (NEXT_PUBLIC_*)
+#   vars.APP_URL                     public URL shown on the GitHub deployment
+# Set `entry` to the server file; for Nitro/TanStack Start add `output-dir: .output`
+# and `entry: server/index.mjs`.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One production deploy at a time; a newer push waits and supersedes queued ones.
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    uses: matheuscarddoso/platform/.github/workflows/deploy-node.yml@v1
+    permissions:
+      contents: read
+      packages: write
+    with:
+      deploy-host: ${{ vars.DEPLOY_HOST }}
+      known-hosts: ${{ vars.DEPLOY_KNOWN_HOSTS }}
+      environment-url: ${{ vars.APP_URL }}
+      entry: server.js
+    secrets:
+      deploy-ssh-key: ${{ secrets.DEPLOY_SSH_KEY }}
+      build-env: ${{ secrets.BUILD_ENV }}

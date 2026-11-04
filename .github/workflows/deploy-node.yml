@@ -1,0 +1,337 @@
+# Reusable workflow for Node apps that aren't Next.js: a plain Node server
+# (shipped as source + production dependencies) or a framework that emits a
+# self-contained server bundle (Nitro/TanStack Start/Nuxt: .output). Same
+# pipeline as deploy-nextjs.yml: cached install, build on the runner, image
+# assembled by crane on the shared runtime base, rollout through Coolify.
+#
+# Why it is fast:
+#   - node_modules is restored from cache;
+#   - no Docker daemon and no image build: crane appends three reproducible
+#     layers (deps, public, app) onto the shared runtime base directly in the
+#     registry. Unchanged layers keep their digest, so they are neither
+#     uploaded by CI nor downloaded by the server;
+#   - the server never builds, it only swaps containers.
+#
+# Usage (in the app repository): see templates/deploy.yml.
+name: Deploy Node
+
+on:
+  workflow_call:
+    inputs:
+      deploy-host:
+        description: Server hostname or IP address.
+        type: string
+        required: true
+      known-hosts:
+        description: Pinned SSH host key line for deploy-host (never trust on first use in CI).
+        type: string
+        required: true
+      node-version:
+        description: Node.js major version (22, 24, 26). Defaults to .nvmrc / .node-version, then 24.
+        type: string
+        default: ''
+      working-directory:
+        description: Directory holding package.json and the lockfile.
+        type: string
+        default: .
+      environment-url:
+        description: Public URL shown on the GitHub deployment.
+        type: string
+        default: ''
+      output-dir:
+        description: Self-contained build output to ship (e.g. .output). Empty ships the git-tracked source plus production dependencies.
+        type: string
+        default: ''
+      entry:
+        description: Server entry point, relative to what is shipped (server.js, or server/index.mjs inside .output).
+        type: string
+        default: server.js
+      exclude:
+        description: Space-separated paths left out of the image when shipping source (tools, tests, docs).
+        type: string
+        default: ''
+    secrets:
+      deploy-ssh-key:
+        description: Per-repository deploy key bound to this app on the server.
+        required: true
+      build-env:
+        description: dotenv-formatted variables exposed only to the build step (e.g. NEXT_PUBLIC_*).
+        required: false
+
+env:
+  CRANE_VERSION: v0.22.1
+  CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+  RUNTIME_IMAGE: ghcr.io/matheuscarddoso/nextjs-runtime
+
+jobs:
+  deploy:
+    name: Build & deploy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    environment:
+      name: production
+      url: ${{ inputs.environment-url }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      WD: ${{ inputs.working-directory }}
+      # Test-only binaries the production build never uses (~200 MB+ on a cold install).
+      CYPRESS_INSTALL_BINARY: '0'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect toolchain
+        id: tc
+        env:
+          NODE_INPUT: ${{ inputs.node-version }}
+        run: |
+          set -euo pipefail
+          node="$NODE_INPUT"
+          if [[ -z "$node" ]]; then
+            for f in .nvmrc .node-version; do
+              if [[ -f "$f" ]]; then node="$(tr -d ' \r\nv' < "$f")"; break; fi
+            done
+          fi
+          node="${node%%.*}"
+          [[ "$node" =~ ^[0-9]+$ ]] || node=24
+          case "$node" in 22|24|26) ;; *) echo "::error::Node $node has no runtime image (supported: 22, 24, 26)"; exit 1 ;; esac
+
+          if   [[ -f pnpm-lock.yaml ]];        then pm=pnpm; lock=pnpm-lock.yaml
+          elif [[ -f bun.lock ]];              then pm=bun;  lock=bun.lock
+          elif [[ -f bun.lockb ]];             then pm=bun;  lock=bun.lockb
+          elif [[ -f yarn.lock ]];             then pm=yarn; lock=yarn.lock
+          elif [[ -f package-lock.json ]];     then pm=npm;  lock=package-lock.json
+          else echo "::error::No lockfile found in $WD"; exit 1; fi
+
+          # Node from the runner's tool cache when it has this major: skips a
+          # download and a version-manifest round trip.
+          cached="$(ls -d /opt/hostedtoolcache/node/"$node".*/x64 2>/dev/null | sort -V | tail -1 || true)"
+          if [[ -n "$cached" ]]; then echo "$cached/bin" >> "$GITHUB_PATH"; fi
+
+          {
+            echo "node=$node"
+            echo "node-cached=$([[ -n "$cached" ]] && echo true || echo false)"
+            echo "pm=$pm"
+            echo "lock=$WD/$lock"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
+            echo "tag=${GITHUB_SHA::12}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Node $node${cached:+ (tool cache)} · $pm · $lock"
+
+      - name: Setup Node.js
+        if: steps.tc.outputs.node-cached != 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ steps.tc.outputs.node }}
+          package-manager-cache: false
+
+      - name: Setup Bun
+        if: steps.tc.outputs.pm == 'bun'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - name: Enable Corepack
+        if: steps.tc.outputs.pm == 'pnpm' || steps.tc.outputs.pm == 'yarn'
+        run: |
+          command -v corepack >/dev/null || npm install -g corepack@latest --no-audit --no-fund
+          corepack enable
+
+      - name: Restore node_modules
+        id: nm
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ inputs.working-directory }}/node_modules
+          key: nm-${{ runner.os }}-node${{ steps.tc.outputs.node }}-${{ hashFiles(steps.tc.outputs.lock, format('{0}/package.json', inputs.working-directory), format('{0}/**/schema.prisma', inputs.working-directory)) }}
+
+      - name: Install dependencies
+        if: steps.nm.outputs.cache-hit != 'true'
+        env:
+          PM: ${{ steps.tc.outputs.pm }}
+        run: |
+          case "$PM" in
+            npm)  npm ci --no-audit --no-fund ;;
+            pnpm) pnpm install --frozen-lockfile ;;
+            bun)  bun install --frozen-lockfile ;;
+            yarn) if [[ -f .yarnrc.yml ]]; then yarn install --immutable; else yarn install --frozen-lockfile; fi ;;
+          esac
+
+      - name: Run postinstall (node_modules from cache)
+        # A cache hit skips the install, and with it the package's own
+        # postinstall, which often generates files outside node_modules
+        # (copied workers, generated clients). Run it explicitly.
+        if: steps.nm.outputs.cache-hit == 'true'
+        env:
+          PM: ${{ steps.tc.outputs.pm }}
+        run: |
+          if node -e 'process.exit(require("./package.json").scripts?.postinstall ? 0 : 1)'; then
+            "$PM" run postinstall
+          fi
+
+      - name: Build
+        env:
+          PM: ${{ steps.tc.outputs.pm }}
+          BUILD_ENV: ${{ secrets.build-env }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${BUILD_ENV:-}" ]]; then
+            # Turn the dotenv secret into masked, safely quoted exports for this
+            # step only. Nothing is written to disk, so it can never end up in
+            # the image.
+            cat > "$RUNNER_TEMP/env2sh.cjs" <<'JS'
+          const { parseEnv } = require("node:util");
+          const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+          for (const [k, v] of Object.entries(parseEnv(process.env.BUILD_ENV))) {
+            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) continue;
+            // Public values (inlined in the client bundle) and URLs aren't secrets;
+            // masking them would also hide the deployment URL in the run.
+            const isPublic = k.startsWith("NEXT_PUBLIC_") || /_URL$/.test(k);
+            if (!isPublic) for (const line of String(v).split("\n")) if (line.length >= 4) console.log(`echo ${q("::add-mask::" + line)}`);
+            console.log(`export ${k}=${q(v)}`);
+          }
+          JS
+            eval "$(node "$RUNNER_TEMP/env2sh.cjs")"
+            rm -f "$RUNNER_TEMP/env2sh.cjs"
+          fi
+          unset BUILD_ENV
+          # Node's default heap is far below the runner's RAM; large apps run out
+          # of memory in `next build` (type check). Give it 75% of the machine,
+          # unless the app chose its own limit.
+          if [[ "${NODE_OPTIONS:-}" != *max-old-space-size* ]]; then
+            heap_mb="$(awk '/MemTotal/ {print int($2 / 1024 * 0.75)}' /proc/meminfo)"
+            export NODE_OPTIONS="--max-old-space-size=$heap_mb ${NODE_OPTIONS:-}"
+          fi
+          if node -e 'process.exit(require("./package.json").scripts?.build ? 0 : 1)'; then
+            "$PM" run build
+          else
+            echo "no build script; shipping as is"
+          fi
+
+      - name: Package layers
+        id: pkg
+        env:
+          PM: ${{ steps.tc.outputs.pm }}
+          OUTPUT_DIR: ${{ inputs.output-dir }}
+          EXCLUDE: ${{ inputs.exclude }}
+          ENTRY: ${{ inputs.entry }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/stage"; out="$RUNNER_TEMP/layers"
+          rm -rf "$stage" "$out" && mkdir -p "$stage/srv" "$out"
+          commit_time="$(git log -1 --format=%ct)"
+
+          if [[ -n "$OUTPUT_DIR" ]]; then
+            # Framework bundle (Nitro .output and friends): already contains
+            # its own trimmed dependencies.
+            [[ -d "$OUTPUT_DIR" ]] || { echo "::error::$OUTPUT_DIR not found after build"; exit 1; }
+            cp -a "$OUTPUT_DIR/." "$stage/srv/"
+          else
+            # Source: git-tracked files only (never untracked or ignored files
+            # such as .env), minus excluded paths, plus production dependencies
+            # installed fresh from the lockfile.
+            git ls-files -z | tar --null -T - -cf - | tar -xf - -C "$stage/srv"
+            for x in $EXCLUDE .github; do rm -rf "${stage:?}/srv/$x"; done
+            if [[ -f "$stage/srv/package.json" ]] && node -e 'const p=require(process.argv[1]);process.exit(Object.keys(p.dependencies||{}).length?0:1)' "$stage/srv/package.json"; then
+              ( cd "$stage/srv" && case "$PM" in
+                  npm)  npm ci --omit=dev --ignore-scripts --no-audit --no-fund ;;
+                  pnpm) pnpm install --prod --frozen-lockfile --ignore-scripts ;;
+                  bun)  bun install --production --frozen-lockfile --ignore-scripts ;;
+                  yarn) yarn workspaces focus --production 2>/dev/null || yarn install --production --frozen-lockfile --ignore-scripts ;;
+                esac )
+            fi
+          fi
+          [[ -f "$stage/srv/$ENTRY" ]] || { echo "::error::entry $ENTRY not found in the image"; exit 1; }
+          cd "$stage"
+
+          tarx() {
+            local mtime="$1" dest="$2"; shift 2
+            tar --sort=name --format=posix \
+                --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+                --mtime="@$mtime" --owner=1000 --group=1000 --numeric-owner \
+                -cf "$dest" "$@"
+          }
+          mapfile -t deps < <(find srv -type d -name node_modules -prune | sort)
+          layers=()
+          if ((${#deps[@]})); then tarx 946684800 "$out/deps.tar" "${deps[@]}"; layers+=("$out/deps.tar"); fi
+          tarx "$commit_time" "$out/app.tar" --exclude=node_modules srv
+          layers+=("$out/app.tar")
+          ls -lh "$out" | awk 'NR>1 {print "  " $5 "\t" $9}'
+          echo "layers=${layers[*]}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.tc.outputs.image }}
+          TAG: ${{ steps.tc.outputs.tag }}
+          NODE_MAJOR: ${{ steps.tc.outputs.node }}
+          LAYERS: ${{ steps.pkg.outputs.layers }}
+          ENTRY: ${{ inputs.entry }}
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"
+          curl -fsSL -o "$RUNNER_TEMP/ggcr.tgz" \
+            "https://github.com/google/go-containerregistry/releases/download/$CRANE_VERSION/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "$CRANE_SHA256  $RUNNER_TEMP/ggcr.tgz" | sha256sum -c --quiet
+          tar -xzf "$RUNNER_TEMP/ggcr.tgz" -C "$bin" crane
+          crane() { "$bin/crane" --platform linux/amd64 "$@"; }
+          crane auth login ghcr.io -u "$GITHUB_ACTOR" --password-stdin <<<"$GH_TOKEN" >/dev/null
+
+          crane mutate "$RUNTIME_IMAGE:node$NODE_MAJOR" \
+            --label org.opencontainers.image.source="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --workdir /srv --cmd node --cmd "$ENTRY" \
+            -t "$IMAGE:base-node$NODE_MAJOR" >/dev/null
+
+          args=(); for l in $LAYERS; do args+=(-f "$l"); done
+          crane append -b "$IMAGE:base-node$NODE_MAJOR" "${args[@]}" -t "$IMAGE:$TAG"
+          crane tag "$IMAGE:$TAG" main
+
+      - name: Deploy
+        env:
+          SSH_KEY: ${{ secrets.deploy-ssh-key }}
+          KNOWN_HOSTS: ${{ inputs.known-hosts }}
+          HOST: ${{ inputs.deploy-host }}
+          TAG: ${{ steps.tc.outputs.tag }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes \
+              -o StrictHostKeyChecking=yes -o ServerAliveInterval=15 \
+              "deploy@$HOST" "deploy $TAG"
+          rm -f ~/.ssh/deploy_key
+
+      - name: Summary
+        if: always()
+        env:
+          IMAGE: ${{ steps.tc.outputs.image }}
+          TAG: ${{ steps.tc.outputs.tag }}
+          PUSHED_AT: ${{ github.event.repository.pushed_at }}
+          URL: ${{ inputs.environment-url }}
+          STATUS: ${{ job.status }}
+        run: |
+          # pushed_at is epoch seconds on push events, an ISO date otherwise.
+          if [[ "$PUSHED_AT" =~ ^[0-9]+$ ]]; then
+            timing="$(( $(date +%s) - PUSHED_AT ))s from push to live"
+          else
+            timing="manual run"
+          fi
+          {
+            echo "### Deploy ${STATUS}"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`$IMAGE:$TAG\` |"
+            if [[ -n "$URL" ]]; then echo "| URL | $URL |"; fi
+            echo "| Timing | $timing |"
+          } >> "$GITHUB_STEP_SUMMARY"
