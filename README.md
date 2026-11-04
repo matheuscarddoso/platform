@@ -18,6 +18,7 @@ git push main ──► GitHub Actions ──► GHCR ──► ssh (forced comm
 | `server/ci-deploy` | Forced-command entrypoint the CI key can run. Sets the image tag on the Coolify app and waits for the rollout. |
 | `.github/workflows/deploy-nextjs.yml` | Reusable workflow: build, package as image, push to GHCR, deploy. |
 | `templates/deploy.yml` | The ~20 lines each app repository adds. |
+| `server/await-dns-then-deploy` | For a domain cutover: waits until public DNS points at the server, then redeploys so Traefik issues the certificates. Run with `systemd-run`. |
 | `scripts/onboard-app.sh` | Registers an app: Coolify resource, per-repo deploy key, GitHub secrets/variables. |
 
 ## Security model

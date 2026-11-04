@@ -146,6 +146,7 @@ chown deploy:deploy /home/deploy/.ssh/authorized_keys
 chmod 0600 /home/deploy/.ssh/authorized_keys
 install -d -m 0750 -o root -g deploy /etc/ci-deploy /etc/ci-deploy/apps
 install -m 0755 "$HERE/ci-deploy" /usr/local/bin/ci-deploy
+install -m 0755 "$HERE/await-dns-then-deploy" /usr/local/sbin/await-dns-then-deploy
 
 log "Done"
 echo "  interface: $PUBLIC_IF"

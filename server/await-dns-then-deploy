@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Waits until every domain resolves to this server on public DNS, then
+# redeploys the app so Traefik requests the Let's Encrypt certificates.
+#   await-dns-then-deploy <app> <tag> <domain>...
+set -u
+app=$1 tag=$2; shift 2
+ip=$(curl -fsS -4 https://api.ipify.org)
+resolves() { curl -fsS -H "accept: application/dns-json" "https://cloudflare-dns.com/dns-query?name=$1&type=A" | jq -e --arg ip "$ip" "[.Answer[]? | select(.type==1) | .data] | length > 0 and all(. == \$ip)" >/dev/null; }
+for i in $(seq 1 1440); do
+  ok=1; for d in "$@"; do resolves "$d" || ok=0; done
+  (( ok )) && break; sleep 15
+done
+(( ok )) || { echo "DNS never pointed here; giving up"; exit 1; }
+echo "DNS points here for: $*; waiting 120s for resolver caches"; sleep 120
+runuser -u deploy -- env SSH_ORIGINAL_COMMAND="deploy $tag" /usr/local/bin/ci-deploy "$app"
+for i in $(seq 1 30); do
+  all=1; for d in "$@"; do
+    issuer=$(echo | timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "$d" 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null)
+    [[ "$issuer" == *"Let's Encrypt"* ]] || all=0
+  done
+  (( all )) && { echo "TLS OK for: $*"; exit 0; }; sleep 10
+done
+echo "certificates not issued yet; check: docker logs coolify-proxy | grep -i acme"; exit 1
