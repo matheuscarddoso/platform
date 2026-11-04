@@ -227,12 +227,23 @@ jobs:
           stage="$RUNNER_TEMP/stage"; out="$RUNNER_TEMP/layers"
           rm -rf "$stage" "$out" && mkdir -p "$stage/srv" "$out"
           cp -a .next/standalone/. "$stage/srv/"
-          mkdir -p "$stage/$approot/.next"
-          cp -a .next/static "$stage/$approot/.next/static"
+          # Merge with "src/." : the standalone output may already contain
+          # public/ or .next/ (files traced from server code), and
+          # `cp -a dir dest/dir` would then nest them as dest/dir/dir.
+          mkdir -p "$stage/$approot/.next/static"
+          cp -a .next/static/. "$stage/$approot/.next/static/"
           # Mount point for the persistent image/ISR cache volume. Docker seeds a
           # new volume with this directory's ownership, so the app can write to it.
           mkdir -p "$stage/$approot/.next/cache"
-          if [[ -d public ]]; then cp -a public "$stage/$approot/public"; fi
+          if [[ -d public ]]; then
+            mkdir -p "$stage/$approot/public"
+            cp -a public/. "$stage/$approot/public/"
+            # Guard: every top-level entry of public/ must be served from the root.
+            for entry in public/* public/.[!.]*; do
+              [[ -e "$entry" ]] || continue
+              [[ -e "$stage/$approot/$entry" ]] || { echo "::error::$entry missing from the image"; exit 1; }
+            done
+          fi
           cd "$stage"
 
           # Reproducible tar: same content => same digest => skipped on push and pull.
