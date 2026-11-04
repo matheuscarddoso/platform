@@ -5,7 +5,8 @@
 #   PLATFORM_HOST=<ip> scripts/onboard-app.sh <owner/repo> [options]
 #
 # Options:
-#   --domain <url>        Public URL(s), comma-separated (https://example.com). Default: sslip.io
+#   --domain <url>        Public URL(s), comma-separated (https://example.com). An HTTPS
+#                         sslip.io preview host (noindex) is always added.
 #   --redirect <mode>     www | non-www | both (default both: no www redirect)
 #   --memory <limit>      Container memory limit (default 768m)
 #   --port <port>         Port the app listens on (default 3000)
@@ -79,9 +80,17 @@ body="$(jq -cn --arg p "$project" --arg s "$server" --arg n "$app" --arg i "$ima
     health_check_retries: 15, health_check_start_period: 1,
     rolling_update_drain_seconds: 3,
     limits_memory: $m, redirect: $r, is_permanent_redirect_enabled: true
-  } + (if $d == "" then {autogenerate_domain: true} else {domains: $d} end)')"
+  } + (if $d == "" then {autogenerate_domain: false} else {domains: $d} end)')"
 uuid="$(api -X POST "$B/applications/dockerimage" -d "$body" | jq -r '.uuid // empty')"
 [[ -n "$uuid" ]] || { echo "failed to create application" >&2; exit 1; }
+# Every app also answers on an HTTPS preview host (sslip.io resolves the
+# embedded IP), so it can be tested with a valid certificate before DNS moves.
+# It is kept out of search engines with an X-Robots-Tag: noindex.
+ip="$(curl -fsS -4 https://api.ipify.org)"
+preview="https://$uuid.$ip.sslip.io"
+api -X PATCH "$B/applications/$uuid" -d "$(jq -cn --arg d "$domain" --arg p "$preview" \
+  '{domains: ([$d, $p] | map(select(. != "")) | join(",")), noindex_domains: [$p]}')" >/dev/null \
+  || { echo "failed to add preview domain" >&2; exit 1; }
 if [[ "$cache_volume" == yes ]]; then
   # Image optimization (AVIF/WebP encodes) and ISR output survive deploys.
   api -X POST "$B/applications/$uuid/storages" \
