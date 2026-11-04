@@ -42,7 +42,7 @@ git push main ──► GitHub Actions ──► GHCR ──► ssh (forced comm
 # Re-apply server configuration (safe to run any time)
 rsync -a --delete server/ root@$HOST:/opt/platform/ && ssh root@$HOST /opt/platform/bootstrap.sh
 
-# Open the Coolify panel (tunnel + browser)
+# Open the Coolify panel at http://localhost:8800 (tunnel + browser; PANEL_PORT to change)
 PLATFORM_HOST=$HOST scripts/panel.sh
 
 # Onboard an app
