@@ -45,7 +45,8 @@ api -X PATCH "$API/applications/$uuid" \
   -d "$(jq -cn --arg t "$tag" '{docker_registry_image_tag: $t}')" >/dev/null \
   || die "failed to set image tag"
 
-resp="$(api "$API/deploy?uuid=$uuid&force=false")" || die "failed to queue deployment"
+resp="$(api -X POST "$API/deploy" -d "$(jq -cn --arg u "$uuid" '{uuid: $u, force: false}')")" \
+  || die "failed to queue deployment"
 dep="$(jq -r '.deployments[0].deployment_uuid // empty' <<<"$resp")"
 [[ -n "$dep" ]] || die "unexpected deploy response: $resp"
 echo "  deployment $dep queued"

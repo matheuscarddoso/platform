@@ -42,7 +42,8 @@ gh repo view "$REPO" --json name >/dev/null || die "cannot access $REPO with gh"
 echo "→ $REPO as '$APP' ($IMAGE)"
 
 # --- 1+2. Coolify application and binding (runs on the server) -------------
-UUID="$(ssh "root@$HOST" bash -s -- "$APP" "$IMAGE" "$DOMAIN" "$MEMORY" "$PORT" <<'REMOTE'
+# ssh flattens argv into one string; %q keeps empty and spaced args intact.
+UUID="$(ssh "root@$HOST" "bash -s -- $(printf '%q ' "$APP" "$IMAGE" "$DOMAIN" "$MEMORY" "$PORT")" <<'REMOTE'
 set -Eeuo pipefail
 app="$1" image="$2" domain="$3" memory="$4" port="$5"
 envf="/etc/ci-deploy/apps/$app.env"
@@ -82,7 +83,7 @@ echo "  coolify app: $UUID"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 ssh-keygen -q -t ed25519 -N '' -C "ci:$REPO" -f "$tmp/key"
 pub="$(cat "$tmp/key.pub")"
-ssh "root@$HOST" bash -s -- "$APP" "$REPO" <<REMOTE
+ssh "root@$HOST" "bash -s -- $(printf '%q ' "$APP" "$REPO")" <<REMOTE
 set -Eeuo pipefail
 ak=/home/deploy/.ssh/authorized_keys
 awk -v c="ci:\$2" '\$NF != c' "\$ak" > "\$ak.new"
