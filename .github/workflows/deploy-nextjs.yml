@@ -3,11 +3,12 @@
 # server (health-checked, zero-downtime).
 #
 # Why it is fast:
-#   - node_modules and .next/cache are restored from cache, so a typical push
-#     only recompiles what changed;
-#   - the build runs natively on the runner (no Docker build stage); the image
-#     is a single COPY on top of a base the server already has, so push and
-#     pull move only the app layer;
+#   - node_modules and .next/cache are restored from cache, so a push only
+#     recompiles what changed;
+#   - no Docker daemon and no image build: crane appends three reproducible
+#     layers (deps, public, app) onto the shared runtime base directly in the
+#     registry. Unchanged layers keep their digest, so they are neither
+#     uploaded by CI nor downloaded by the server;
 #   - the server never builds, it only swaps containers.
 #
 # Usage (in the app repository): see templates/deploy.yml.
@@ -25,7 +26,7 @@ on:
         type: string
         required: true
       node-version:
-        description: Node.js major version. Defaults to .nvmrc / .node-version, then 24.
+        description: Node.js major version (22, 24, 26). Defaults to .nvmrc / .node-version, then 24.
         type: string
         default: ''
       working-directory:
@@ -43,6 +44,11 @@ on:
       build-env:
         description: dotenv-formatted variables exposed only to the build step (e.g. NEXT_PUBLIC_*).
         required: false
+
+env:
+  CRANE_VERSION: v0.22.1
+  CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+  RUNTIME_IMAGE: ghcr.io/matheuscarddoso/nextjs-runtime
 
 jobs:
   deploy:
@@ -83,6 +89,7 @@ jobs:
           fi
           node="${node%%.*}"
           [[ "$node" =~ ^[0-9]+$ ]] || node=24
+          case "$node" in 22|24|26) ;; *) echo "::error::Node $node has no runtime image (supported: 22, 24, 26)"; exit 1 ;; esac
 
           if   [[ -f pnpm-lock.yaml ]];        then pm=pnpm; lock=pnpm-lock.yaml
           elif [[ -f bun.lock ]];              then pm=bun;  lock=bun.lock
@@ -91,16 +98,23 @@ jobs:
           elif [[ -f package-lock.json ]];     then pm=npm;  lock=package-lock.json
           else echo "::error::No lockfile found in $WD"; exit 1; fi
 
+          # Node from the runner's tool cache when it has this major: skips a
+          # download and a version-manifest round trip.
+          cached="$(ls -d /opt/hostedtoolcache/node/"$node".*/x64 2>/dev/null | sort -V | tail -1 || true)"
+          if [[ -n "$cached" ]]; then echo "$cached/bin" >> "$GITHUB_PATH"; fi
+
           {
             echo "node=$node"
+            echo "node-cached=$([[ -n "$cached" ]] && echo true || echo false)"
             echo "pm=$pm"
             echo "lock=$WD/$lock"
             echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
             echo "tag=${GITHUB_SHA::12}"
           } >> "$GITHUB_OUTPUT"
-          echo "Node $node · $pm · $lock"
+          echo "Node $node${cached:+ (tool cache)} · $pm · $lock"
 
       - name: Setup Node.js
+        if: steps.tc.outputs.node-cached != 'true'
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ steps.tc.outputs.node }}
@@ -169,7 +183,7 @@ jobs:
           unset BUILD_ENV
           "$PM" run build
 
-      - name: Package image context
+      - name: Package layers
         id: pkg
         run: |
           set -euo pipefail
@@ -181,56 +195,78 @@ jobs:
           server="$(cd .next/standalone && find . -name server.js -not -path '*/node_modules/*' -printf '%d %p\n' | sort -n | head -1 | cut -d' ' -f2)"
           [[ -n "$server" ]] || { echo "::error::server.js not found in .next/standalone"; exit 1; }
           appdir="$(dirname "${server#./}")"
+          approot="srv${appdir:+/$appdir}"; approot="${approot%/.}"
+          commit_time="$(git log -1 --format=%ct)"
 
-          ctx="$RUNNER_TEMP/image"
-          rm -rf "$ctx" && mkdir -p "$ctx"
-          cp -a .next/standalone "$ctx/app"
-          mkdir -p "$ctx/app/$appdir/.next"
-          cp -a .next/static "$ctx/app/$appdir/.next/static"
-          if [[ -d public ]]; then cp -a public "$ctx/app/$appdir/public"; fi
+          stage="$RUNNER_TEMP/stage"; out="$RUNNER_TEMP/layers"
+          rm -rf "$stage" "$out" && mkdir -p "$stage/srv" "$out"
+          cp -a .next/standalone/. "$stage/srv/"
+          mkdir -p "$stage/$approot/.next"
+          cp -a .next/static "$stage/$approot/.next/static"
+          if [[ -d public ]]; then cp -a public "$stage/$approot/public"; fi
+          cd "$stage"
 
-          cat > "$ctx/Dockerfile" <<'DOCKERFILE'
-          ARG NODE_MAJOR=24
-          FROM busybox:1.38-musl AS busybox
-          FROM node:${NODE_MAJOR}-slim
-          ARG APP_DIR=.
-          ENV NODE_ENV=production \
-              PORT=3000 \
-              HOSTNAME=0.0.0.0 \
-              NEXT_TELEMETRY_DISABLED=1
-          # Static wget (~1 MB) for health checks; avoids an apt layer per image.
-          COPY --from=busybox /bin/busybox /usr/local/bin/wget
-          COPY --chown=node:node app /srv
-          WORKDIR /srv/${APP_DIR}
-          USER node
-          EXPOSE 3000
-          HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
-            CMD ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/"]
-          CMD ["node", "server.js"]
-          DOCKERFILE
+          # Reproducible tar: same content => same digest => skipped on push and pull.
+          tarx() {
+            local mtime="$1" dest="$2"; shift 2
+            tar --sort=name --format=posix \
+                --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+                --mtime="@$mtime" --owner=1000 --group=1000 --numeric-owner \
+                -cf "$dest" "$@"
+          }
+          # Content-derived timestamp: Next.js serves public/ with mtime-based
+          # ETags, so they must change exactly when the content does.
+          content_epoch() {
+            local h; h="$(find "$@" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-8)"
+            echo $(( 946684800 + 16#$h % 500000000 ))
+          }
 
-          echo "ctx=$ctx" >> "$GITHUB_OUTPUT"
+          mapfile -t deps < <(find srv -type d -name node_modules -prune | sort)
+          layers=()
+          if ((${#deps[@]})); then tarx 946684800 "$out/deps.tar" "${deps[@]}"; layers+=("$out/deps.tar"); fi
+          if [[ -d "$approot/public" ]]; then
+            tarx "$(content_epoch "$approot/public")" "$out/public.tar" "$approot/public"
+            layers+=("$out/public.tar")
+          fi
+          tarx "$commit_time" "$out/app.tar" --exclude=node_modules --exclude="./$approot/public" --exclude="$approot/public" srv
+          layers+=("$out/app.tar")
+
+          ls -lh "$out" | awk 'NR>1 {print "  " $5 "\t" $9}'
           echo "appdir=$appdir" >> "$GITHUB_OUTPUT"
-          du -sh "$ctx/app"
+          echo "layers=${layers[*]}" >> "$GITHUB_OUTPUT"
 
-      - name: Build & push image
+      - name: Publish image
         env:
           GH_TOKEN: ${{ github.token }}
           IMAGE: ${{ steps.tc.outputs.image }}
           TAG: ${{ steps.tc.outputs.tag }}
           NODE_MAJOR: ${{ steps.tc.outputs.node }}
-          CTX: ${{ steps.pkg.outputs.ctx }}
           APP_DIR: ${{ steps.pkg.outputs.appdir }}
+          LAYERS: ${{ steps.pkg.outputs.layers }}
         run: |
           set -euo pipefail
-          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          docker build "$CTX" --pull \
-            --build-arg NODE_MAJOR="$NODE_MAJOR" \
-            --build-arg APP_DIR="$APP_DIR" \
+          bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"
+          curl -fsSL -o "$RUNNER_TEMP/ggcr.tgz" \
+            "https://github.com/google/go-containerregistry/releases/download/$CRANE_VERSION/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "$CRANE_SHA256  $RUNNER_TEMP/ggcr.tgz" | sha256sum -c --quiet
+          tar -xzf "$RUNNER_TEMP/ggcr.tgz" -C "$bin" crane
+          crane() { "$bin/crane" --platform linux/amd64 "$@"; }
+
+          crane auth login ghcr.io -u "$GITHUB_ACTOR" --password-stdin <<<"$GH_TOKEN" >/dev/null
+
+          # 1. Runtime base re-labelled for this repo (layers are cross-repo
+          #    mounted inside GHCR, nothing is copied).
+          workdir="/srv${APP_DIR:+/$APP_DIR}"; workdir="${workdir%/.}"
+          crane mutate "$RUNTIME_IMAGE:node$NODE_MAJOR" \
             --label org.opencontainers.image.source="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --label org.opencontainers.image.revision="$GITHUB_SHA" \
-            -t "$IMAGE:$TAG" -t "$IMAGE:main"
-          docker push --all-tags "$IMAGE"
+            --workdir "$workdir" \
+            -t "$IMAGE:base-node$NODE_MAJOR" >/dev/null
+
+          # 2. Append app layers; blobs GHCR already has are skipped.
+          args=(); for l in $LAYERS; do args+=(-f "$l"); done
+          crane append -b "$IMAGE:base-node$NODE_MAJOR" "${args[@]}" -t "$IMAGE:$TAG"
+          crane tag "$IMAGE:$TAG" main
 
       - name: Deploy
         env:
@@ -257,14 +293,18 @@ jobs:
           URL: ${{ inputs.environment-url }}
           STATUS: ${{ job.status }}
         run: |
-          elapsed=""
-          if [[ "$PUSHED_AT" =~ ^[0-9]+$ ]]; then elapsed="$(( $(date +%s) - PUSHED_AT ))s from push to live"; fi
+          # pushed_at is epoch seconds on push events, an ISO date otherwise.
+          if [[ "$PUSHED_AT" =~ ^[0-9]+$ ]]; then
+            timing="$(( $(date +%s) - PUSHED_AT ))s from push to live"
+          else
+            timing="manual run"
+          fi
           {
             echo "### Deploy ${STATUS}"
-            echo ""
+            echo
             echo "| | |"
             echo "|---|---|"
             echo "| Image | \`$IMAGE:$TAG\` |"
-            [[ -n "$URL" ]] && echo "| URL | $URL |"
-            [[ -n "$elapsed" ]] && echo "| Time | $elapsed |"
+            if [[ -n "$URL" ]]; then echo "| URL | $URL |"; fi
+            echo "| Timing | $timing |"
           } >> "$GITHUB_STEP_SUMMARY"

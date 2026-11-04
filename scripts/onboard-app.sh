@@ -64,8 +64,9 @@ body="$(jq -cn --arg p "$project" --arg s "$server" --arg n "$app" --arg i "$ima
     ports_exposes: $port, instant_deploy: false,
     health_check_enabled: true, health_check_path: "/", health_check_port: $port,
     health_check_host: "127.0.0.1", health_check_method: "GET", health_check_return_code: 200,
-    health_check_scheme: "http", health_check_interval: 5, health_check_timeout: 3,
-    health_check_retries: 10, health_check_start_period: 5,
+    health_check_scheme: "http", health_check_interval: 2, health_check_timeout: 3,
+    health_check_retries: 15, health_check_start_period: 1,
+    rolling_update_drain_seconds: 3,
     limits_memory: $m
   } + (if $d == "" then {autogenerate_domain: true} else {domains: $d} end)')"
 uuid="$(api -X POST "$B/applications/dockerimage" -d "$body" | jq -r '.uuid // empty')"
