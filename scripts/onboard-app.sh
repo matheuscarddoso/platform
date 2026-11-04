@@ -5,9 +5,13 @@
 #   PLATFORM_HOST=<ip> scripts/onboard-app.sh <owner/repo> [options]
 #
 # Options:
-#   --domain <url>     Public URL(s), comma-separated (https://example.com). Default: sslip.io
-#   --memory <limit>   Container memory limit (default 768m)
-#   --port <port>      Port the app listens on (default 3000)
+#   --domain <url>        Public URL(s), comma-separated (https://example.com). Default: sslip.io
+#   --redirect <mode>     www | non-www | both (default both: no www redirect)
+#   --memory <limit>      Container memory limit (default 768m)
+#   --port <port>         Port the app listens on (default 3000)
+#   --health-path <path>  Health check path (default /)
+#   --health-code <code>  Expected health check status (default 200)
+#   --no-cache-volume     Don't persist .next/cache (image optimization + ISR) across deploys
 #
 # What it does:
 #   1. creates the Coolify application (Docker image from GHCR) if missing;
@@ -22,17 +26,23 @@ die() { echo "error: $*" >&2; exit 1; }
 HOST="${PLATFORM_HOST:-}"
 [[ -n "$HOST" ]] || die "set PLATFORM_HOST"
 REPO="${1:-}"; shift || true
-[[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "usage: $0 <owner/repo> [--domain url] [--memory 768m] [--port 3000]"
+[[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "usage: $0 <owner/repo> [options] (see header)"
 
-DOMAIN="" MEMORY="768m" PORT="3000"
+DOMAIN="" REDIRECT="both" MEMORY="768m" PORT="3000" HPATH="/" HCODE="200" CACHE_VOLUME="yes"
 while (($#)); do
   case "$1" in
-    --domain) DOMAIN="$2"; shift 2 ;;
-    --memory) MEMORY="$2"; shift 2 ;;
-    --port)   PORT="$2";   shift 2 ;;
+    --domain)          DOMAIN="$2";   shift 2 ;;
+    --redirect)        REDIRECT="$2"; shift 2 ;;
+    --memory)          MEMORY="$2";   shift 2 ;;
+    --port)            PORT="$2";     shift 2 ;;
+    --health-path)     HPATH="$2";    shift 2 ;;
+    --health-code)     HCODE="$2";    shift 2 ;;
+    --no-cache-volume) CACHE_VOLUME="no"; shift ;;
     *) die "unknown option $1" ;;
   esac
 done
+[[ "$REDIRECT" =~ ^(www|non-www|both)$ ]] || die "--redirect must be www, non-www or both"
+[[ "$HCODE" =~ ^[0-9]{3}$ ]] || die "--health-code must be an HTTP status"
 
 APP="$(basename "$REPO" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')"
 IMAGE="ghcr.io/$(tr '[:upper:]' '[:lower:]' <<<"$REPO")"
@@ -43,9 +53,9 @@ echo "→ $REPO as '$APP' ($IMAGE)"
 
 # --- 1+2. Coolify application and binding (runs on the server) -------------
 # ssh flattens argv into one string; %q keeps empty and spaced args intact.
-UUID="$(ssh "root@$HOST" "bash -s -- $(printf '%q ' "$APP" "$IMAGE" "$DOMAIN" "$MEMORY" "$PORT")" <<'REMOTE'
+UUID="$(ssh "root@$HOST" "bash -s -- $(printf '%q ' "$APP" "$IMAGE" "$DOMAIN" "$MEMORY" "$PORT" "$REDIRECT" "$HPATH" "$HCODE" "$CACHE_VOLUME")" <<'REMOTE'
 set -Eeuo pipefail
-app="$1" image="$2" domain="$3" memory="$4" port="$5"
+app="$1" image="$2" domain="$3" memory="$4" port="$5" redirect="$6" hpath="$7" hcode="$8" cache_volume="$9"
 envf="/etc/ci-deploy/apps/$app.env"
 if [[ -f "$envf" ]]; then sed -n 's/^COOLIFY_APP_UUID=//p' "$envf"; exit 0; fi
 
@@ -58,19 +68,26 @@ project="$(api "$B/projects" | jq -r '.[] | select(.name=="production") | .uuid'
 server="$(api "$B/servers" | jq -r '.[] | select(.name=="localhost") | .uuid' | head -1)"
 
 body="$(jq -cn --arg p "$project" --arg s "$server" --arg n "$app" --arg i "$image" \
-  --arg d "$domain" --arg m "$memory" --arg port "$port" '{
+  --arg d "$domain" --arg m "$memory" --arg port "$port" --arg r "$redirect" \
+  --arg hp "$hpath" --argjson hc "$hcode" '{
     project_uuid: $p, server_uuid: $s, environment_name: "production",
     name: $n, docker_registry_image_name: $i, docker_registry_image_tag: "main",
     ports_exposes: $port, instant_deploy: false,
-    health_check_enabled: true, health_check_path: "/", health_check_port: $port,
-    health_check_host: "127.0.0.1", health_check_method: "GET", health_check_return_code: 200,
+    health_check_enabled: true, health_check_path: $hp, health_check_port: $port,
+    health_check_host: "127.0.0.1", health_check_method: "GET", health_check_return_code: $hc,
     health_check_scheme: "http", health_check_interval: 2, health_check_timeout: 3,
     health_check_retries: 15, health_check_start_period: 1,
     rolling_update_drain_seconds: 3,
-    limits_memory: $m
+    limits_memory: $m, redirect: $r, is_permanent_redirect_enabled: true
   } + (if $d == "" then {autogenerate_domain: true} else {domains: $d} end)')"
 uuid="$(api -X POST "$B/applications/dockerimage" -d "$body" | jq -r '.uuid // empty')"
 [[ -n "$uuid" ]] || { echo "failed to create application" >&2; exit 1; }
+if [[ "$cache_volume" == yes ]]; then
+  # Image optimization (AVIF/WebP encodes) and ISR output survive deploys.
+  api -X POST "$B/applications/$uuid/storages" \
+    -d "$(jq -cn --arg n "$app-next-cache" '{type: "persistent", name: $n, mount_path: "/srv/.next/cache"}')" >/dev/null \
+    || { echo "failed to create cache volume" >&2; exit 1; }
+fi
 umask 027
 printf 'COOLIFY_APP_UUID=%s\n' "$uuid" > "$envf"
 chgrp deploy "$envf"

@@ -68,6 +68,10 @@ jobs:
     env:
       NEXT_TELEMETRY_DISABLED: '1'
       WD: ${{ inputs.working-directory }}
+      # Test-only binaries the production build never uses (~200 MB+ on a cold install).
+      CYPRESS_INSTALL_BINARY: '0'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
 
     steps:
       - name: Checkout
@@ -149,6 +153,18 @@ jobs:
             yarn) if [[ -f .yarnrc.yml ]]; then yarn install --immutable; else yarn install --frozen-lockfile; fi ;;
           esac
 
+      - name: Run postinstall (node_modules from cache)
+        # A cache hit skips the install, and with it the package's own
+        # postinstall, which often generates files outside node_modules
+        # (copied workers, generated clients). Run it explicitly.
+        if: steps.nm.outputs.cache-hit == 'true'
+        env:
+          PM: ${{ steps.tc.outputs.pm }}
+        run: |
+          if node -e 'process.exit(require("./package.json").scripts?.postinstall ? 0 : 1)'; then
+            "$PM" run postinstall
+          fi
+
       - name: Restore Next.js build cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -203,6 +219,9 @@ jobs:
           cp -a .next/standalone/. "$stage/srv/"
           mkdir -p "$stage/$approot/.next"
           cp -a .next/static "$stage/$approot/.next/static"
+          # Mount point for the persistent image/ISR cache volume. Docker seeds a
+          # new volume with this directory's ownership, so the app can write to it.
+          mkdir -p "$stage/$approot/.next/cache"
           if [[ -d public ]]; then cp -a public "$stage/$approot/public"; fi
           cd "$stage"
 
