@@ -189,7 +189,10 @@ jobs:
           const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
           for (const [k, v] of Object.entries(parseEnv(process.env.BUILD_ENV))) {
             if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) continue;
-            for (const line of String(v).split("\n")) if (line.length >= 4) console.log(`echo ${q("::add-mask::" + line)}`);
+            // Public values (inlined in the client bundle) and URLs aren't secrets;
+            // masking them would also hide the deployment URL in the run.
+            const isPublic = k.startsWith("NEXT_PUBLIC_") || /_URL$/.test(k);
+            if (!isPublic) for (const line of String(v).split("\n")) if (line.length >= 4) console.log(`echo ${q("::add-mask::" + line)}`);
             console.log(`export ${k}=${q(v)}`);
           }
           JS
@@ -197,6 +200,13 @@ jobs:
             rm -f "$RUNNER_TEMP/env2sh.cjs"
           fi
           unset BUILD_ENV
+          # Node's default heap is far below the runner's RAM; large apps run out
+          # of memory in `next build` (type check). Give it 75% of the machine,
+          # unless the app chose its own limit.
+          if [[ "${NODE_OPTIONS:-}" != *max-old-space-size* ]]; then
+            heap_mb="$(awk '/MemTotal/ {print int($2 / 1024 * 0.75)}' /proc/meminfo)"
+            export NODE_OPTIONS="--max-old-space-size=$heap_mb ${NODE_OPTIONS:-}"
+          fi
           "$PM" run build
 
       - name: Package layers
