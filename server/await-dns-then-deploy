@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Waits until every domain resolves to this server on public DNS, then
 # redeploys the app so Traefik requests the Let's Encrypt certificates.
-#   await-dns-then-deploy <app> <tag> <domain>...
+#   await-dns-then-deploy <app> <domain>...
+# Redeploys whatever image tag the app runs at cutover time.
 set -u
-app=$1 tag=$2; shift 2
+app=$1; shift
 ip=$(curl -fsS -4 https://api.ipify.org)
 resolves() { curl -fsS -H "accept: application/dns-json" "https://cloudflare-dns.com/dns-query?name=$1&type=A" | jq -e --arg ip "$ip" "[.Answer[]? | select(.type==1) | .data] | length > 0 and all(. == \$ip)" >/dev/null; }
 for i in $(seq 1 1440); do
@@ -12,6 +13,8 @@ for i in $(seq 1 1440); do
 done
 (( ok )) || { echo "DNS never pointed here; giving up"; exit 1; }
 echo "DNS points here for: $*; waiting 120s for resolver caches"; sleep 120
+uuid=$(sed -n "s/^COOLIFY_APP_UUID=//p" "/etc/ci-deploy/apps/$app.env")
+tag=$(docker exec coolify-db psql -U coolify -d coolify -tAc "select docker_registry_image_tag from applications where uuid = '$uuid'")
 runuser -u deploy -- env SSH_ORIGINAL_COMMAND="deploy $tag" /usr/local/bin/ci-deploy "$app"
 for i in $(seq 1 30); do
   all=1; for d in "$@"; do
