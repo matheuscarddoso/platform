@@ -250,13 +250,13 @@ jobs:
           # new volume with this directory's ownership, so the app can write to it.
           mkdir -p "$stage/$approot/.next/cache"
 
-          # Make request URLs use the public host, as on Vercel. Standalone Next
-          # builds every route handler's request.url from its listen address
-          # (http://0.0.0.0:3000 or localhost:3000), so redirects and origin
-          # checks built from it break behind the proxy. With
-          # experimental.trustHostHeader and the listen hostname hidden while the
-          # URL is built, Next uses the Host header instead. Safe here: Traefik
-          # only forwards hosts configured for this app.
+          # Public URLs behind the proxy, as on Vercel. Standalone Next builds
+          # request URLs from its listen address (0.0.0.0:3000 / localhost:3000):
+          # route-handler redirects and origin checks then break, and middleware
+          # redirects can leak the internal address. The shim builds request
+          # URLs from the Host header (trustHostHeader) and relativizes any
+          # Location still pointing at the internal address. Safe: Traefik only
+          # forwards hosts configured for this app.
           node - "$stage/$approot/server.js" <<'JS'
           const fs = require("node:fs");
           const file = process.argv[2];
@@ -269,9 +269,13 @@ jobs:
           src = src.replace(m[0], `const nextConfig = ${JSON.stringify(config)}`);
           const anchor = "const { startServer } = require('next/dist/server/lib/start-server')";
           if (!src.includes(anchor)) fail("startServer require");
-          const shim = `// platform: build request URLs from the Host header (as on Vercel), not from
-          // the listen address. Next uses the listen hostname whenever one is set; hide it
-          // while the request URL is built so the trustHostHeader branch applies.
+          const shim = `// platform: public URLs behind the proxy (as on Vercel).
+          // 1. Route handlers: build request.url from the Host header, not from the
+          //    listen address. Next uses the listen hostname whenever one is set; hide it
+          //    while the request URL is built so the trustHostHeader branch applies.
+          // 2. Safety net: a Location header that still points at the internal address
+          //    (0.0.0.0/localhost:PORT, e.g. a middleware redirect built from its own
+          //    request.url) becomes relative, so the browser stays on the public host.
           {
             const NextNodeServer = require('next/dist/server/next-server').default
             const attach = NextNodeServer && NextNodeServer.prototype.attachRequestMeta
@@ -281,11 +285,33 @@ jobs:
               this.fetchHostname = undefined
               try { return attach.apply(this, args) } finally { this.fetchHostname = fetchHostname }
             }
+            const INTERNAL = /^https?:\\/\\/(?:0\\.0\\.0\\.0|localhost|127\\.0\\.0\\.1|\\[::1?\\])(?::\\d+)?(?=[/?#]|$)/i
+            const fix = (name, value) => {
+              if (typeof name !== 'string' || name.toLowerCase() !== 'location') return value
+              const one = (v) => (typeof v === 'string' ? v.replace(INTERNAL, '') || '/' : v)
+              return Array.isArray(value) ? value.map(one) : one(value)
+            }
+            const http = require('node:http')
+            const R = http.ServerResponse.prototype
+            const setHeader = R.setHeader
+            R.setHeader = function (name, value) { return setHeader.call(this, name, fix(name, value)) }
+            if (R.appendHeader) {
+              const appendHeader = R.appendHeader
+              R.appendHeader = function (name, value) { return appendHeader.call(this, name, fix(name, value)) }
+            }
+            const writeHead = R.writeHead
+            R.writeHead = function (status, ...rest) {
+              for (const h of rest) {
+                if (Array.isArray(h)) { for (let i = 0; i < h.length; i++) if (Array.isArray(h[i])) h[i][1] = fix(h[i][0], h[i][1]); else if (i % 2 === 0 && typeof h[i] === 'string') h[i + 1] = fix(h[i], h[i + 1]) }
+                else if (h && typeof h === 'object') for (const k of Object.keys(h)) h[k] = fix(k, h[k])
+              }
+              return writeHead.call(this, status, ...rest)
+            }
           }
           `;
           src = src.replace(anchor, shim + anchor);
           fs.writeFileSync(file, src);
-          console.log("server.js: request URLs follow the Host header");
+          console.log("server.js: public URLs behind the proxy");
           JS
           if [[ -d public ]]; then
             mkdir -p "$stage/$approot/public"
