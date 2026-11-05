@@ -11,7 +11,9 @@
 #                         URL rewrite, ACL sync (cloud export), storage objects copy
 #   F  verify             ACL diff == cloud, DB SQL tests, realtime check
 # After F, the caller points the app at the new stack (env + CI deploy) and runs
-# activate-crons.sh. Inputs on stdin: cloud login role, its password.
+# activate-crons.sh. Input on stdin: a Supabase Management API token (kept in
+# memory only): cloud crons are toggled and short-lived CLI login roles (5 min
+# TTL) are minted through it, a fresh one right before each dump.
 set -Eeuo pipefail
 STACK=/opt/stacks/kubofood-supabase
 MIG=$STACK/migration
@@ -19,45 +21,51 @@ WORK=/root/sbmig/cutover-$(date -u +%Y%m%dT%H%M%SZ)
 APP_UUID=441khsoyzvfgziplconlvss5
 REF=vtbipnkbejcffxmjtshm
 mkdir -p "$WORK"; exec > >(tee -a "$WORK/cutover.log") 2>&1
-read -r ROLE; read -r PW
-CLOUD_URL="postgresql://$ROLE.$REF:$PW@aws-0-us-west-2.pooler.supabase.com:5432/postgres"
+read -r SBTOKEN
 T=$(cat /etc/ci-deploy/coolify.token); B=http://127.0.0.1:8000/api/v1
 api() { curl -fsS --max-time 60 -H "Authorization: Bearer $T" -H "Content-Type: application/json" -H "Accept: application/json" "$@"; }
-cloud_sql() { docker run --rm -i supabase/postgres:17.6.1.136 psql "$CLOUD_URL" -X -q -v ON_ERROR_STOP=1 "$@"; }
+mgmt_sql() { curl -fsS --max-time 120 -X POST "https://api.supabase.com/v1/projects/$REF/database/query" -H "Authorization: Bearer $SBTOKEN" -H "Content-Type: application/json" -d "$(jq -Rs '{query: .}')"; }
+login() {
+  local r; r=$(curl -fsS --max-time 30 -X POST "https://api.supabase.com/v1/projects/$REF/cli/login-role" -H "Authorization: Bearer $SBTOKEN" -H "Content-Type: application/json" -d '{"read_only": false}')
+  CLOUD_URL="postgresql://$(jq -r .role <<<"$r").$REF:$(jq -r .password <<<"$r")@aws-0-us-west-2.pooler.supabase.com:5432/postgres"
+}
 local_sql() { docker exec -i kubofood-sb-db psql -U supabase_admin -d postgres -X -q -v ON_ERROR_STOP=1 "$@"; }
 step() { printf '\n[%s] %s\n' "$(date -u +%T)" "$*"; }
 FROZEN=0
 rollback() {
   step "ROLLBACK: re-enabling cloud crons and restarting the app on Supabase Cloud"
-  [[ $FROZEN == 1 ]] && { echo "update cron.job set active = true;" | cloud_sql || echo "!! re-enable cloud crons BY HAND"; }
+  [[ $FROZEN == 1 ]] && { echo "update cron.job set active = true;" | mgmt_sql >/dev/null || echo "!! re-enable cloud crons BY HAND"; }
   api -X POST "$B/applications/$APP_UUID/start" >/dev/null || echo "!! start the app BY HAND"
   echo "rolled back; production is on Supabase Cloud, unchanged."
 }
 trap 'rc=$?; [[ $rc -ne 0 ]] && rollback; exit $rc' EXIT
 
-step "A. freeze writes"
+step "0. preflight + fresh stack (before the freeze; staging copy discarded)"
+echo "select count(*) as jobs from cron.job;" | mgmt_sql | jq -e '.[0].jobs == 20' >/dev/null || { echo "management API check failed"; exit 1; }
 docker rm -f kubofood-staging >/dev/null 2>&1 || true
+( cd "$STACK" && docker compose down >/dev/null 2>&1 && rm -rf volumes/db/data volumes/storage && docker volume rm -f kubofood-supabase_db-config >/dev/null && ./deploy.sh | tail -2 )
+
+step "A. freeze writes"
 api -X POST "$B/applications/$APP_UUID/stop" >/dev/null
 for i in $(seq 1 60); do [[ -z "$(docker ps -q --filter name=$APP_UUID)" ]] && break; sleep 2; done
 [[ -z "$(docker ps -q --filter name=$APP_UUID)" ]] || { echo "app did not stop"; exit 1; }
-echo "update cron.job set active = false; select count(*) filter (where active) as still_active from cron.job;" | cloud_sql -At
-FROZEN=1; echo "app stopped, cloud crons off"
+FROZEN=1
+echo "update cron.job set active = false; select count(*) filter (where active) as still from cron.job;" | mgmt_sql | jq -e '.[0].still == 0' >/dev/null || { echo "cloud crons did not stop"; exit 1; }
+echo "app stopped, cloud crons off"
 sleep 5   # let in-flight requests settle
-
-step "B. fresh stack (staging copy discarded)"
-( cd "$STACK" && docker compose down >/dev/null 2>&1 && rm -rf volumes/db/data volumes/storage && docker volume rm -f kubofood-supabase_db-config >/dev/null && ./deploy.sh | tail -3 )
 
 step "C. dump from cloud (after freeze)"
 cd "$WORK"
-supabase db dump --db-url "$CLOUD_URL" -f roles.sql --role-only >/dev/null 2>cli-roles.log
-supabase db dump --db-url "$CLOUD_URL" -f schema.sql >/dev/null 2>cli-schema.log
-supabase db dump --db-url "$CLOUD_URL" -f data.sql --use-copy --data-only -x storage.buckets_vectors -x storage.vector_indexes >/dev/null 2>cli-data.log
+login; supabase db dump --db-url "$CLOUD_URL" -f roles.sql --role-only >/dev/null 2>cli-roles.log
+login; supabase db dump --db-url "$CLOUD_URL" -f schema.sql >/dev/null 2>cli-schema.log
+login; supabase db dump --db-url "$CLOUD_URL" -f data.sql --use-copy --data-only -x storage.buckets_vectors -x storage.vector_indexes >/dev/null 2>cli-data.log
 sha256sum roles.sql schema.sql data.sql | tee SHA256SUMS
-cloud_sql -At -F ' ' < $MIG/fingerprint.sql > fp.cloud
-cloud_sql -At < "$MIG/acl-export.sql" > acl.cloud
-cloud_sql -At -F $'\t' -c "select bucket_id, name, coalesce(metadata->>'mimetype',''), coalesce(metadata->>'cacheControl',''), coalesce(metadata->>'size',''), coalesce(metadata->>'eTag','') from storage.objects order by 1, 2" > objects.tsv
+mgmt_sql < "$MIG/fingerprint.sql" | jq -r '.[] | "\(.kind) \(.name) \(.val)"' > fp.cloud
+mgmt_sql < "$MIG/acl-export.sql" | jq -r '.[].stmt' > acl.cloud
+echo "select bucket_id, name, coalesce(metadata->>'mimetype','') as m, coalesce(metadata->>'cacheControl','') as c, coalesce(metadata->>'size','') as s, coalesce(metadata->>'eTag','') as e from storage.objects order by 1, 2;" \
+  | mgmt_sql | jq -r '.[] | [.bucket_id, .name, .m, .c, .s, .e] | @tsv' > objects.tsv
 echo "fingerprint lines: $(wc -l < fp.cloud), acl statements: $(wc -l < acl.cloud), objects: $(wc -l < objects.tsv)"
-[[ $(wc -l < acl.cloud) -gt 100 ]] || { echo "ACL export too small"; exit 1; }
+[[ $(wc -l < acl.cloud) -gt 100 && $(wc -l < fp.cloud) -gt 200 ]] || { echo "export too small"; exit 1; }
 
 step "D. restore + fingerprint"
 for f in roles.sql schema.sql data.sql; do docker cp "$f" kubofood-sb-db:/tmp/$f >/dev/null; done
