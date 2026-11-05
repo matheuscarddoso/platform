@@ -343,10 +343,20 @@ jobs:
           install -m 700 -d ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
-          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes \
-              -o StrictHostKeyChecking=yes -o ServerAliveInterval=15 \
-              "deploy@$HOST" "deploy $TAG"
+          # ssh exits 255 only when it couldn't connect or the link dropped;
+          # retry those (transient network), never a deploy that ran and failed.
+          for attempt in 1 2 3; do
+            rc=0
+            ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes \
+                -o StrictHostKeyChecking=yes -o ServerAliveInterval=15 \
+                -o ConnectTimeout=20 \
+                "deploy@$HOST" "deploy $TAG" || rc=$?
+            [[ $rc -ne 255 ]] && break
+            echo "::warning::ssh to $HOST failed (attempt $attempt); retrying"
+            sleep $(( attempt * 5 ))
+          done
           rm -f ~/.ssh/deploy_key
+          exit $rc
 
       - name: Summary
         if: always()
