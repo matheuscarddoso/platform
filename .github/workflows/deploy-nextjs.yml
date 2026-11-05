@@ -235,6 +235,30 @@ jobs:
           # Mount point for the persistent image/ISR cache volume. Docker seeds a
           # new volume with this directory's ownership, so the app can write to it.
           mkdir -p "$stage/$approot/.next/cache"
+
+          # Make request URLs use the public host, as on Vercel. Standalone
+          # passes HOSTNAME (0.0.0.0) to Next, which then builds every route
+          # handler's request.url as http://0.0.0.0:3000/..., so redirects and
+          # origin checks built from it break behind the proxy. Without a
+          # hostname and with experimental.trustHostHeader, Next builds the URL
+          # from the Host header instead. Safe here: Traefik only forwards hosts
+          # configured for this app. The server still listens on every interface.
+          node - "$stage/$approot/server.js" <<'JS'
+          const fs = require("node:fs");
+          const file = process.argv[2];
+          let src = fs.readFileSync(file, "utf8");
+          const fail = (what) => { console.error(`::error::standalone server.js changed shape (${what}); update the host patch in deploy-nextjs.yml`); process.exit(1); };
+          const host = "const hostname = process.env.HOSTNAME || '0.0.0.0'";
+          if (!src.includes(host)) fail("hostname line");
+          src = src.replace(host, "const hostname = undefined // platform: listen on all interfaces, URLs from the Host header");
+          const m = src.match(/^const nextConfig = (\{.*\})$/m);
+          if (!m) fail("nextConfig line");
+          const config = JSON.parse(m[1]);
+          config.experimental = { ...(config.experimental || {}), trustHostHeader: true };
+          src = src.replace(m[0], `const nextConfig = ${JSON.stringify(config)}`);
+          fs.writeFileSync(file, src);
+          console.log("server.js: request URLs follow the Host header");
+          JS
           if [[ -d public ]]; then
             mkdir -p "$stage/$approot/public"
             cp -a public/. "$stage/$approot/public/"
