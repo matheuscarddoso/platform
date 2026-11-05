@@ -88,6 +88,9 @@ uuid="$(api -X POST "$B/applications/dockerimage" -d "$body" | jq -r '.uuid // e
 # It is kept out of search engines with an X-Robots-Tag: noindex.
 ip="$(curl -fsS -4 https://api.ipify.org)"
 preview="https://$uuid.$ip.sslip.io"
+# With a www redirect, Coolify redirects every non-www host, the preview
+# included; give the preview the www form so it is not redirected away.
+[[ "$redirect" == www ]] && preview="https://www.$uuid.$ip.sslip.io"
 api -X PATCH "$B/applications/$uuid" -d "$(jq -cn --arg d "$domain" --arg p "$preview" \
   '{domains: ([$d, $p] | map(select(. != "")) | join(",")), noindex_domains: [$p]}')" >/dev/null \
   || { echo "failed to add preview domain" >&2; exit 1; }
