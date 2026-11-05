@@ -3,7 +3,7 @@
 #
 # Phases (each verified; any failure before the app restarts on the new stack
 # triggers rollback(): cloud crons back on, the app back up on cloud; no data loss):
-#   A  freeze writes      stop the app, disable cloud crons
+#   A  freeze writes      stop the app, disable cloud crons (cron.alter_job)
 #   B  fresh stack        wipe the staging copy, re-init the stack (services migrate)
 #   C  dump               Supabase CLI dump of roles, schema, data (fresh login role on stdin)
 #   D  restore            single transaction, then fingerprint == cloud (after freeze)
@@ -24,7 +24,7 @@ mkdir -p "$WORK"; exec > >(tee -a "$WORK/cutover.log") 2>&1
 read -r SBTOKEN
 T=$(cat /etc/ci-deploy/coolify.token); B=http://127.0.0.1:8000/api/v1
 api() { curl -fsS --max-time 60 -H "Authorization: Bearer $T" -H "Content-Type: application/json" -H "Accept: application/json" "$@"; }
-mgmt_sql() { curl -fsS --max-time 120 -X POST "https://api.supabase.com/v1/projects/$REF/database/query" -H "Authorization: Bearer $SBTOKEN" -H "Content-Type: application/json" -d "$(jq -Rs '{query: .}')"; }
+mgmt_sql() { curl -fsS --max-time 120 -X POST "https://api.supabase.com/v1/projects/$REF/database/query" -H "Authorization: Bearer $SBTOKEN" -H "Content-Type: application/json" -d "$(jq -Rs '{query: ., read_only: false}')"; }   # runs as postgres
 login() {
   local r; r=$(curl -fsS --max-time 30 -X POST "https://api.supabase.com/v1/projects/$REF/cli/login-role" -H "Authorization: Bearer $SBTOKEN" -H "Content-Type: application/json" -d '{"read_only": false}')
   CLOUD_URL="postgresql://$(jq -r .role <<<"$r").$REF:$(jq -r .password <<<"$r")@aws-0-us-west-2.pooler.supabase.com:5432/postgres"
@@ -34,7 +34,7 @@ step() { printf '\n[%s] %s\n' "$(date -u +%T)" "$*"; }
 FROZEN=0
 rollback() {
   step "ROLLBACK: re-enabling cloud crons and restarting the app on Supabase Cloud"
-  [[ $FROZEN == 1 ]] && { echo "update cron.job set active = true;" | mgmt_sql >/dev/null || echo "!! re-enable cloud crons BY HAND"; }
+  [[ $FROZEN == 1 ]] && { echo "select count(cron.alter_job(jobid, active := true)) from cron.job;" | mgmt_sql >/dev/null || echo "!! re-enable cloud crons BY HAND"; }
   api -X POST "$B/applications/$APP_UUID/start" >/dev/null || echo "!! start the app BY HAND"
   echo "rolled back; production is on Supabase Cloud, unchanged."
 }
@@ -50,7 +50,9 @@ api -X POST "$B/applications/$APP_UUID/stop" >/dev/null
 for i in $(seq 1 60); do [[ -z "$(docker ps -q --filter name=$APP_UUID)" ]] && break; sleep 2; done
 [[ -z "$(docker ps -q --filter name=$APP_UUID)" ]] || { echo "app did not stop"; exit 1; }
 FROZEN=1
-echo "update cron.job set active = false; select count(*) filter (where active) as still from cron.job;" | mgmt_sql | jq -e '.[0].still == 0' >/dev/null || { echo "cloud crons did not stop"; exit 1; }
+# cron.job is not directly writable on Supabase Cloud; alter_job() is, for the jobs' owner (postgres).
+echo "select count(cron.alter_job(jobid, active := false)) as n from cron.job;" | mgmt_sql | jq -e '.[0].n == 20' >/dev/null || { echo "cloud crons did not stop"; exit 1; }
+echo "select count(*) filter (where active) as still from cron.job;" | mgmt_sql | jq -e '.[0].still == 0' >/dev/null || { echo "cloud crons still active"; exit 1; }
 echo "app stopped, cloud crons off"
 sleep 5   # let in-flight requests settle
 
