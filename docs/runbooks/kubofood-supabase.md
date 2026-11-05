@@ -16,6 +16,27 @@ Open items:
 
 Restore drill (2026-11-05): full `pg_restore --clean --if-exists` of an hourly dump into a throwaway `supabase/postgres:17.6.1.136` container with `--network none`: 0 errors, and the fingerprint matched live except `public.marketplace_connections` (the row the 30 s poll updates). Restoring only `--schema=public` does not work, because tables depend on extensions outside it.
 
+After a restore onto a new instance, Vault secrets do not decrypt (`invalid ciphertext`): the root key lives in the old instance's `db-config` volume, not in the dump. Run `delete from vault.secrets`, then `migration/30-vault.sql` with `app_url` and the app's `CRON_SECRET`.
+
+## Order-to-print verification (2026-11-05)
+
+Run on an isolated clone (internal Docker network, no internet, production image, production data restored from backup, real Chromium), simulating the desktop app of the only restaurant with printers. Production received nothing: 71 orders before and after.
+
+| Check | Result |
+| --- | --- |
+| `createOrder` server action with a real shopper session | order created, items and notes correct |
+| Kitchen broadcast reaching the browser | 0.08 s |
+| Kitchen screen | card shown with items and notes |
+| Job claimed and sent to `print_raw` (Tauri mocked) | 4.1 to 4.3 s, ticket text correct |
+| Same flow with realtime dead | 11.8 s, through the 15 s poll |
+| `print_jobs` and `print_events` | `impresso`, attempt 1, full trail |
+
+Also on production: a real browser joined realtime from `www.kubofood.app` in 74 ms and received a broadcast; `_next/image` and storage return 200; the Resend key and Google client are valid.
+
+**Not covered:** Tauri's `print_raw` into the Windows spooler and the paper. That code is local to the desktop app and does not involve the database. It takes one real order on site.
+
+**The agent only runs signed in.** `NEXTAUTH_SECRET` was regenerated when leaving Vercel, so every session died. A printing computer stays silent until someone signs in again; check `printers.last_seen_at`.
+
 ## Why
 
 Supabase Cloud runs in us-west-2 (Oregon). The app runs in Campinas, so every query
