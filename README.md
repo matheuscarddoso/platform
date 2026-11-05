@@ -27,8 +27,12 @@ git push main ──► GitHub Actions ──► GHCR ──► ssh (forced comm
 - **SSH**: keys only, no passwords. `root` (for Coolify and admins) and `deploy` are the only accounts allowed.
 - **Firewall**: ufw allows only 22, 80 and 443 on the host. Docker-published ports go around ufw, so a
   `DOCKER-USER` allowlist (in `ufw/after*.rules`) lets the internet reach containers only on 80/443.
-  The Coolify panel (8000), its websockets (6001/6002) and the Traefik dashboard (8080) are reachable
-  only through an SSH tunnel.
+  The raw Coolify ports (8000, 6001/6002) and the Traefik dashboard (8080) stay closed; the panel is
+  served only through Traefik on 443.
+- **Coolify panel**: public at `https://coolify.ocardoso.com` (login + 2FA). Its API is restricted to
+  `127.0.0.1, ::1, 10.0.0.0/8` (Coolify → Settings → API "Allowed IPs"), so a leaked token is useless
+  from the internet; `ci-deploy` reaches it locally. Verified with spoofed `X-Forwarded-For`,
+  `X-Real-IP` and `CF-Connecting-IP`: still refused. The SSH tunnel (`scripts/panel.sh`) keeps working.
 - **CI**: every repository gets its own key. On the server, that key can only run
   `ci-deploy <its-app>`, with no shell, PTY or forwarding. A leaked key can redeploy one app with
   an image tag from that app's own GHCR repository, and nothing more.
