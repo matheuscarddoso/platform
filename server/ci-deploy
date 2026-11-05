@@ -45,27 +45,37 @@ api -X PATCH "$API/applications/$uuid" \
   -d "$(jq -cn --arg t "$tag" '{docker_registry_image_tag: $t}')" >/dev/null \
   || die "failed to set image tag"
 
-resp="$(api -X POST "$API/deploy" -d "$(jq -cn --arg u "$uuid" '{uuid: $u, force: false}')")" \
-  || die "failed to queue deployment"
-dep="$(jq -r '.deployments[0].deployment_uuid // empty' <<<"$resp")"
-[[ -n "$dep" ]] || die "unexpected deploy response: $resp"
-echo "  deployment $dep queued"
+# One Coolify rollout; returns 0 when live, 1 when it failed (the previous
+# version keeps serving: a failed rolling update discards the new container).
+rollout() {
+  local resp dep body status last=""
+  resp="$(api -X POST "$API/deploy" -d "$(jq -cn --arg u "$uuid" '{uuid: $u, force: false}')")" \
+    || die "failed to queue deployment"
+  dep="$(jq -r '.deployments[0].deployment_uuid // empty' <<<"$resp")"
+  [[ -n "$dep" ]] || die "unexpected deploy response: $resp"
+  echo "  deployment $dep queued"
+  while (( SECONDS - started < TIMEOUT_S )); do
+    body="$(api "$API/deployments/$dep")" || { sleep 2; continue; }
+    status="$(jq -r '.status' <<<"$body")"
+    [[ "$status" != "$last" ]] && { echo "  status: $status ($(( SECONDS - started ))s)"; last="$status"; }
+    case "$status" in
+      finished) return 0 ;;
+      failed|cancelled*) echo "  ✗ deployment $dep $status after $(( SECONDS - started ))s" >&2; return 1 ;;
+    esac
+    sleep 1
+  done
+  die "timed out after ${TIMEOUT_S}s (deployment $dep is still running in Coolify)"
+}
 
-last=""
-while (( SECONDS - started < TIMEOUT_S )); do
-  body="$(api "$API/deployments/$dep")" || { sleep 2; continue; }
-  status="$(jq -r '.status' <<<"$body")"
-  [[ "$status" != "$last" ]] && { echo "  status: $status ($(( SECONDS - started ))s)"; last="$status"; }
-  case "$status" in
-    finished)
-      echo "✓ $app live with $tag in $(( SECONDS - started ))s"
-      exit 0 ;;
-    failed|cancelled*)
-      echo "✗ deployment $dep $status after $(( SECONDS - started ))s" >&2
-      # The API withholds deployment logs from non-root tokens; point to them.
-      echo "  logs: Coolify panel → Projects → production → $app → Deployments" >&2
-      exit 1 ;;
-  esac
-  sleep 1
+# A second attempt absorbs transient failures (a registry connection reset
+# mid-pull); layers already downloaded are reused, so the retry is quick.
+for attempt in 1 2; do
+  if rollout; then
+    echo "✓ $app live with $tag in $(( SECONDS - started ))s"
+    exit 0
+  fi
+  (( attempt == 1 )) && { echo "  retrying once in 5s…" >&2; sleep 5; }
 done
-die "timed out after ${TIMEOUT_S}s (deployment $dep is still running in Coolify)"
+# The API withholds deployment logs from non-root tokens; point to them.
+echo "✗ $app: deployment failed twice; logs: Coolify panel → Projects → production → $app → Deployments" >&2
+exit 1
