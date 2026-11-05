@@ -1,6 +1,20 @@
 # Runbook: kubofood, Supabase Cloud → self-hosted Supabase on the platform server
 
-Status: **rehearsal in progress** (2026-11-05). The staging copy is restored and verified; production is untouched.
+Status: **cut over** (2026-11-05). Production runs on the self-hosted stack at `https://api.kubofood.app`. Cloud is frozen as the rollback source (crons off) until 2026-12-05. **Off-site backups are still open**: see below.
+
+## Cutover record (2026-11-05, UTC)
+
+- 03:18:39 write freeze (app stopped, cloud crons off). 03:30 app healthy on the new stack: about 11.5 min of downtime.
+- Verified: fingerprint identical across 212 tables, 626 ACL entries identical, 638 storage objects copied and verified, 488 stored URLs rewritten, SQL tests 36/38 (055 and 056 are stale, they fail on cloud too), realtime round trip 22 ms, anon denied on protected tables.
+- First attempt at 03:15 rolled back automatically (cron API call failed before any dump); production was back in 21 s.
+
+Open items:
+
+- **Off-site backups.** `backup.sh` keeps local copies only (`/root/backups/kubofood`: hourly ×48, daily ×30, storage ×14), which do not survive losing the server. Fiscal XMLs carry a 5-year retention obligation, so this must be closed.
+- **Backup failures are silent**: they only reach `/var/log/kubofood-backup.log` and `/root/backups/kubofood/LAST_FAILURE`. Needs alerting.
+- **Before deleting the cloud project:** the WhatsApp bot hardcodes a placeholder image URL on the cloud storage host (`menu-item-images/place…`). Move it to `api.kubofood.app` first.
+
+Restore drill (2026-11-05): full `pg_restore --clean --if-exists` of an hourly dump into a throwaway `supabase/postgres:17.6.1.136` container with `--network none`: 0 errors, and the fingerprint matched live except `public.marketplace_connections` (the row the 30 s poll updates). Restoring only `--schema=public` does not work, because tables depend on extensions outside it.
 
 ## Why
 
