@@ -1,6 +1,6 @@
 # Runbook: kubofood, Supabase Cloud → self-hosted Supabase on the platform server
 
-Status: **planned**. Nothing here has run against production yet.
+Status: **rehearsal in progress** (2026-11-05). The staging copy is restored and verified; production is untouched.
 
 ## Why
 
@@ -61,6 +61,44 @@ Left out: imgproxy, edge functions, supavisor, analytics/vector.
 2. **Legacy JWT secret** from Supabase → Project Settings → JWT Keys.
 3. **DNS:** `A api.kubofood.app → 187.41.119.40` (Squarespace, kubofood.app).
 4. **Maintenance window:** about 30 min, overnight.
+
+
+## Rehearsal findings (2026-11-05)
+
+- **Versions:** after first boot, the auth (82 migrations), storage (80) and realtime
+  migration heads are identical to cloud's. Postgres 17.6.
+- **Dump/restore:** Supabase CLI `db dump` (roles, schema, data with `--use-copy`)
+  through the session pooler (direct is IPv6-only; containers have no IPv6), with a
+  temporary role from `POST /v1/projects/{ref}/cli/login-role` (TTL 5 min). Restore
+  ran in a single transaction with no errors.
+- **Data verification:** all 212 tables in public/auth/storage match by row count
+  and content md5, along with function/trigger/policy/index counts and sequences.
+  The only difference is the row the 30 s marketplace poll touches, which is
+  expected on a live source.
+- **ACL trap (fixed):** pg_dump records ACLs relative to Postgres' built-in defaults,
+  so restored tables picked up self-hosted Supabase's default privileges: ALL for
+  anon/authenticated on **180** tables (cloud: **33**). The repo's own SQL tests
+  caught it ("anon can't read …"). Fix: `50-acl-reset.sql` followed by
+  `acl-export.sql` run on cloud, in one transaction. All 626 ACL entries (tables,
+  views, sequences, functions, default privileges) are now identical to cloud's.
+- **Storage:** the dump omits the managed `storage` schema's 3 RLS policies, which
+  `10-storage-policies.sql` restores. All 638 objects were copied and verified
+  (md5 vs eTag, SHA-256 read-back). Cache-Control is preserved as stored (`max-age=…`).
+- **Stored URLs:** `40-storage-urls.sql` rewrote 488 rows (generated columns are
+  skipped); the assertion confirmed 0 left.
+- **DB tests** (`supabase/tests/*.sql`, each a single rolled-back transaction):
+  36/38 pass. The 2 failures (055, 056) insert a restaurant without `slug`, which is
+  NOT NULL with no default on cloud too; those tests are stale against the schema.
+- **Realtime:** a public WSS join with the anon key, plus a REST broadcast with the
+  service key, delivered the message in 50 ms.
+
+### Post-restore order (cutover script)
+
+1. `psql --single-transaction -f roles.sql -f schema.sql -c 'SET session_replication_role = replica' -f data.sql`
+2. `10-storage-policies.sql` → `20-cron-jobs.sql` (inactive) → `30-vault.sql` (env-specific) →
+   `40-storage-urls.sql` → `50-acl-reset.sql` + cloud ACL export (one transaction)
+3. `copy_storage.py` (objects), then the fingerprint, ACL diff and SQL tests: all must match
+4. Production only: activate crons (`update cron.job set active = true`)
 
 ## Phase 1: staging stack (no production impact)
 
