@@ -37,6 +37,14 @@ on:
         description: Public URL shown on the GitHub deployment.
         type: string
         default: ''
+      app-directory:
+        description: Monorepos only. The Next.js app inside the workspace (e.g. apps/site); install and build run from working-directory.
+        type: string
+        default: ''
+      build-command:
+        description: Build command run from working-directory instead of `<pm> run build` (e.g. a workspace script that builds packages first).
+        type: string
+        default: ''
     secrets:
       deploy-ssh-key:
         description: Per-repository deploy key bound to this app on the server.
@@ -138,7 +146,11 @@ jobs:
         id: nm
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ inputs.working-directory }}/node_modules
+          # Workspace packages keep their own node_modules (pnpm/yarn symlinks).
+          path: |
+            ${{ inputs.working-directory }}/node_modules
+            ${{ inputs.working-directory }}/apps/*/node_modules
+            ${{ inputs.working-directory }}/packages/*/node_modules
           key: nm-${{ runner.os }}-node${{ steps.tc.outputs.node }}-${{ hashFiles(steps.tc.outputs.lock, format('{0}/package.json', inputs.working-directory), format('{0}/**/schema.prisma', inputs.working-directory)) }}
 
       - name: Install dependencies
@@ -168,7 +180,7 @@ jobs:
       - name: Restore Next.js build cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ inputs.working-directory }}/.next/cache
+          path: ${{ inputs.app-directory || inputs.working-directory }}/.next/cache
           key: next-${{ runner.os }}-${{ hashFiles(steps.tc.outputs.lock) }}-${{ github.sha }}
           restore-keys: |
             next-${{ runner.os }}-${{ hashFiles(steps.tc.outputs.lock) }}-
@@ -178,6 +190,7 @@ jobs:
         env:
           PM: ${{ steps.tc.outputs.pm }}
           BUILD_ENV: ${{ secrets.build-env }}
+          BUILD_COMMAND: ${{ inputs.build-command }}
         run: |
           set -euo pipefail
           if [[ -n "${BUILD_ENV:-}" ]]; then
@@ -207,10 +220,11 @@ jobs:
             heap_mb="$(awk '/MemTotal/ {print int($2 / 1024 * 0.75)}' /proc/meminfo)"
             export NODE_OPTIONS="--max-old-space-size=$heap_mb ${NODE_OPTIONS:-}"
           fi
-          "$PM" run build
+          if [[ -n "$BUILD_COMMAND" ]]; then bash -c "$BUILD_COMMAND"; else "$PM" run build; fi
 
       - name: Package layers
         id: pkg
+        working-directory: ${{ inputs.app-directory || inputs.working-directory }}
         run: |
           set -euo pipefail
           if [[ ! -d .next/standalone ]]; then
